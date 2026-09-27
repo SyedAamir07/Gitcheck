@@ -1,0 +1,1 @@
+# No third-party dependencies: Gitcheck uses only the Python 3.10+ standard library and git.
