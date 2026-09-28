@@ -25,8 +25,8 @@ Never push. Never use `--no-verify`. Never edit, delete or `git checkout` the us
 - [ ] 2. Make sure guard hooks are installed
 - [ ] 3. Understand every change
 - [ ] 4. Group changes into tasks
-- [ ] 5. Show the plan and get approval
-- [ ] 6. Dry run, then commit
+- [ ] 5. Show every commit in full, ask Yes / No / Other (loop until Yes or No)
+- [ ] 6. Commit with --yes
 - [ ] 7. Report
 ```
 
@@ -79,28 +79,13 @@ Add a body only when the "why" is not obvious from the summary.
 - Guard `WARN` findings: judge them. `*.local.*` configs, `tmp/`, `scratch/`, debug `.txt` output, localhost in non-code files: usually exclude. Firebase client configs (`google-services.json`, `firebase_options.dart`): usually fine for mobile apps.
 - Also exclude on your own: clearly personal or experimental files (scratch notes, debug dumps, one-off scripts), IDE files, and code changes that only switch URLs/flags to local development values.
 
-### 5. Plan and approval
+### 5. Show every commit in full, then Yes / No / Other
 
-Show the plan per repo before committing anything:
+Nothing is committed before the user has seen every commit and said Yes. This applies to every
+run, including "just commit everything" requests. The only exception is when the user explicitly
+said in this request not to ask (for example "bina puchay commit kar do").
 
-```
-api (branch: main)
-  1. feat(auth): add password reset endpoint
-     src/routes/auth.ts, src/services/reset.ts, test/reset.test.ts
-  2. chore(deps): bump express to 4.19
-     package.json, package-lock.json
-  Excluded (will not be committed):
-     server.log -- log file
-     config/app.local.json -- local-only config
-  Left uncommitted: (none)
-```
-
-Then use the AskQuestion tool: "Commit as planned" / "Change the plan" / "Cancel". Apply requested
-changes and ask again. Skip approval only if the user explicitly said to commit without asking.
-
-### 6. Dry run, then commit
-
-Write the plan to a JSON file in the OS temp folder (`$env:TEMP` on Windows, `/tmp` on macOS/Linux), never inside a repo:
+**a. Write the plan** to a JSON file in the OS temp folder (`$env:TEMP` on Windows, `/tmp` on macOS/Linux), never inside a repo:
 
 ```json
 {
@@ -119,14 +104,54 @@ Write the plan to a JSON file in the OS temp folder (`$env:TEMP` on Windows, `/t
 File paths are relative to the repo with forward slashes, exactly as in `status`. For renames include
 the old path too. Multi-line messages use `\n` (summary, blank line, body).
 
+**b. Preview:** `gitcheck commit <plan.json> --dry-run`. It prints, per repo: every commit with a
+number `[N]`, its full title and body, and every file with its status (new / modified / deleted /
+renamed) and `+added -deleted` lines; files the guard will exclude and why; warnings; files left
+uncommitted. If it excludes something unexpected, fix the plan and preview again.
+
+**c. Show it to the user** in full, in a code block, unshortened. Below it add:
+- one line per commit saying what that task is, in plain words;
+- "Excluded by me" with a reason per file you left out on purpose (step 4), since the preview only
+  lists those under "Left uncommitted".
+
+**d. Ask** with the AskQuestion tool, in the user's language, with exactly these three options:
+- `Yes - commit all of this`
+- `No - cancel, commit nothing`
+- `Other - I want to change something`
+
+**e. Handle the answer:**
+- **Yes**: go to step 6.
+- **No**: delete the plan file, say nothing was committed, stop.
+- **Other** (or anything the user typed): ask what to change with a second AskQuestion
+  (`allow_multiple: true`), built from the current plan:
+  - `Skip commit [N]: <title>`, one option per commit;
+  - `Remove <file> from commit [N]`, one option per file (with more than ~25 files, offer
+    `Remove files from commit [N]` per commit instead and ask per file for the chosen commit);
+  - `Change the message of commit [N]`;
+  - `Move a file to another commit`;
+  - `Add a left-out file`, when there are uncommitted files that the guard did not block.
+  The user can also type the problem in their own words ("commit 2 ka title change karo",
+  "config file nikal do", "ye dono ek hi commit mein daal do"); work out what they mean. If a choice
+  needs more input (a new message, a target commit), ask for it or propose a concrete value.
+  Removed files and skipped commits stay in the working tree, uncommitted.
+- After any change: update the plan JSON, run the preview again, show the full new output, and ask
+  Yes / No / Other again. Repeat until the user says Yes or No.
+
+### 6. Commit
+
+Only after a Yes for the exact plan that was last shown:
+
 ```
-gitcheck commit <plan.json> --dry-run
-gitcheck commit <plan.json>
+gitcheck commit <plan.json> --yes
 ```
 
-If the dry run excludes something unexpected, fix the plan first. The real run clears the index
-(working tree untouched), commits each task, guards each commit before and after, drops blocked
-files automatically, and restores the repo to its starting state if anything fails.
+Without `--yes`, a non-interactive run prints the plan and exits with code 2 without committing, so
+never add `--yes` before the user has approved. (When a person runs the command in a terminal
+without `--yes`, the CLI shows the same preview and asks `[y] yes  [n] no  [o] other` itself.)
+
+The real run clears the index (working tree untouched), commits each task, guards each commit
+before and after, drops blocked files automatically, and restores the repo to its starting state if
+anything fails.
 
 ### 7. Report
 

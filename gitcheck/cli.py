@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from . import committer, config, guard, hooks, installer, skill, status
+from . import committer, config, guard, hooks, installer, review, skill, status
 from .gitops import GitError, discover_repos, enclosing_repo, find_repos, is_repo, repo_root
 
 
@@ -112,17 +112,49 @@ def cmd_guard(args: argparse.Namespace) -> int:
     return 1 if any(f.level == guard.BLOCK for f in findings) else 0
 
 
+def _interactive() -> bool:
+    # Agent shells can report a TTY on stdin; a prompt there would hang, so they must use --yes.
+    if os.environ.get("CURSOR_AGENT"):
+        return False
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def cmd_commit(args: argparse.Namespace) -> int:
     try:
-        results = committer.run_plan(args.plan, dry_run=args.dry_run)
+        plan = committer.load_plan(args.plan)
     except (committer.PlanError, json.JSONDecodeError, OSError) as exc:
         print(f"gitcheck: invalid plan: {exc}", file=sys.stderr)
         return 2
+
+    if args.dry_run:
+        results = review.dry_run(plan)
+        if args.json:
+            print(json.dumps([committer.to_dict(r) for r in results], indent=2))
+        else:
+            print(review.render(plan, results))
+        return 0 if all(r.ok for r in results) else 1
+
+    if not args.yes:
+        if not _interactive():
+            if not args.json:
+                print(review.render(plan, review.dry_run(plan)))
+            print(
+                "gitcheck: nothing committed - approval needed. Show this plan to the user and "
+                "re-run with --yes only after they said yes.",
+                file=sys.stderr,
+            )
+            return 2
+        decision, plan = review.review(plan)
+        if decision != review.APPROVED:
+            print("Cancelled - nothing was committed.")
+            return 3
+
+    results = [committer.run_repo(repo, commits) for repo, commits in plan if commits]
     if args.json:
         print(json.dumps([committer.to_dict(r) for r in results], indent=2))
     else:
-        print("\n\n".join(committer.format_result(r) for r in results))
-        if not args.dry_run and any(r.commits for r in results):
+        print("\n\n".join(committer.format_result(r) for r in results) or "gitcheck: nothing to commit")
+        if any(r.commits for r in results):
             print("\nNothing was pushed. Review with: git log --stat -n <count>")
     return 0 if all(r.ok for r in results) else 1
 
@@ -206,9 +238,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_guard)
 
-    p = sub.add_parser("commit", help="execute a commit plan (JSON), one commit per task")
+    p = sub.add_parser(
+        "commit",
+        help="show a commit plan (JSON) in full, ask yes/no/other, then commit one task per commit",
+    )
     p.add_argument("plan", help="path to the plan JSON file")
-    p.add_argument("--dry-run", action="store_true", help="show what would be committed/excluded")
+    p.add_argument("--dry-run", action="store_true", help="only show every commit, its files and exclusions")
+    p.add_argument("--yes", "-y", action="store_true", help="the user already approved this exact plan; do not ask")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_commit)
 

@@ -181,6 +181,77 @@ class Committer(RepoTestCase):
         self.assertEqual(git("status", "--porcelain", cwd=self.repo).strip(), "")
 
 
+class Review(RepoTestCase):
+    def setUp(self):
+        super().setUp()
+        write(self.repo, "src/auth.ts", "export const login = 1;\n")
+        write(self.repo, "src/auth.test.ts", "test('x', () => {});\n")
+        write(self.repo, "src/chart.ts", "export const chart = 1;\n")
+        write(self.repo, "server.log", "boom\n")
+        self.plan_path = self.plan([
+            {"message": "feat(auth): add login\n\nWhy it matters", "files": ["src/auth.ts", "src/auth.test.ts", "server.log"]},
+            {"message": "feat(chart): add chart", "files": ["src/chart.ts"]},
+        ])
+
+    def run_review(self, answers):
+        from gitcheck import review
+
+        answers = iter(answers)
+        shown = []
+        decision, plan = review.review(
+            committer.load_plan(self.plan_path), ask=lambda _: next(answers), out=shown.append
+        )
+        return decision, plan, "\n".join(shown)
+
+    def test_preview_shows_every_commit_file_and_exclusion(self):
+        _, _, shown = self.run_review(["n"])
+        self.assertIn("[1] feat(auth): add login", shown)
+        self.assertIn("| Why it matters", shown)
+        self.assertIn("[2] feat(chart): add chart", shown)
+        self.assertIn("src/auth.ts  (new, +1 -0)", shown)
+        self.assertIn("server.log  (EXCLUDED by guard", shown)
+        self.assertIn("Total: 2 commit(s), 3 file(s)", shown)
+
+    def test_yes_and_no(self):
+        from gitcheck import review
+
+        self.assertEqual(self.run_review(["yes"])[0], review.APPROVED)
+        self.assertEqual(self.run_review(["no"])[0], review.CANCELLED)
+        self.assertEqual(self.log(), ["init"])
+
+    def test_other_remove_file_skip_commit_and_edit_message(self):
+        from gitcheck import review
+
+        decision, plan, _ = self.run_review([
+            "o", "f", "1", "2",
+            "o", "s", "2",
+            "o", "m", "1", "feat(auth): add login flow", "-",
+            "y",
+        ])
+        self.assertEqual(decision, review.APPROVED)
+        [(_, commits)] = plan
+        self.assertEqual([c.message for c in commits], ["feat(auth): add login flow"])
+        self.assertEqual(commits[0].files, ["src/auth.ts", "server.log"])
+
+    def test_other_move_file_and_drop_empty_commit(self):
+        _, plan, shown = self.run_review(["o", "v", "2", "1", "1", "y"])
+        [(_, commits)] = plan
+        self.assertEqual(len(commits), 1)
+        self.assertIn("src/chart.ts", commits[0].files)
+        self.assertIn("has no files left, removed it", shown)
+
+    def test_cli_refuses_without_approval_when_not_interactive(self):
+        r = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "gitcheck.py"),
+             "commit", self.plan_path],
+            capture_output=True, text=True, stdin=subprocess.DEVNULL, encoding="utf-8",
+        )
+        self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+        self.assertIn("[1] feat(auth): add login", r.stdout)
+        self.assertIn("approval needed", r.stderr)
+        self.assertEqual(self.log(), ["init"])
+
+
 @unittest.skipUnless(shutil.which("git"), "git required")
 class Hooks(RepoTestCase):
     def commit(self):
