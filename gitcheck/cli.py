@@ -6,7 +6,7 @@ import os
 import sys
 from dataclasses import asdict
 
-from . import committer, config, guard, hooks, installer, review, skill, status
+from . import committer, config, guard, hooks, installer, merger, review, skill, status
 from .gitops import GitError, discover_repos, enclosing_repo, find_repos, is_repo, repo_root
 
 
@@ -98,6 +98,8 @@ def cmd_guard(args: argparse.Namespace) -> int:
         mode, changes = "staged", guard.collect_staged(repo)
     elif args.worktree:
         mode, changes = "worktree", guard.collect_worktree(repo)
+    elif args.tracked:
+        mode, changes = "tracked", guard.collect_tracked(repo)
     elif args.unpushed:
         mode, changes = "unpushed", guard.collect_revs(repo, guard.unpushed_rev_sets())
     elif args.range:
@@ -149,7 +151,7 @@ def cmd_commit(args: argparse.Namespace) -> int:
             print("Cancelled - nothing was committed.")
             return 3
 
-    results = [committer.run_repo(repo, commits) for repo, commits in plan if commits]
+    results = [committer.run_repo(repo, commits, hide_local=not args.no_hide) for repo, commits in plan if commits]
     if args.json:
         print(json.dumps([committer.to_dict(r) for r in results], indent=2))
     else:
@@ -157,6 +159,55 @@ def cmd_commit(args: argparse.Namespace) -> int:
         if any(r.commits for r in results):
             print("\nNothing was pushed. Review with: git log --stat -n <count>")
     return 0 if all(r.ok for r in results) else 1
+
+
+def cmd_merge_plan(args: argparse.Namespace) -> int:
+    previews = [merger.preview(r, args.source, args.into, fetch=args.fetch) for r in _repos(args)]
+    if not args.all:
+        previews = [p for p in previews if not p.nothing_to_merge]
+    if args.json:
+        print(json.dumps([merger.preview_dict(p, args.strategy) for p in previews], indent=2))
+    elif not previews:
+        print("gitcheck: nothing to merge in any repo")
+    else:
+        print("\n\n".join(merger.render(p, args.strategy, None, False, False) for p in previews))
+    return 0
+
+
+def cmd_merge(args: argparse.Namespace) -> int:
+    repo = repo_root(args.repo)
+    opts = merger.MergeOptions(
+        strategy=args.strategy,
+        message=args.message.replace("\\n", "\n") if args.message else None,
+        delete_branch=args.delete_branch,
+        push=args.push,
+    )
+    p = merger.preview(repo, args.source, args.into, fetch=args.fetch)
+
+    if not args.yes:
+        if not _interactive():
+            if not args.json:
+                print(merger.render(p, opts.strategy, opts.message, opts.delete_branch, opts.push))
+            if merger.check(p, opts.strategy):
+                print("gitcheck: nothing merged - fix the problems listed under CANNOT MERGE first.", file=sys.stderr)
+            else:
+                print(
+                    "gitcheck: nothing merged - approval needed. Show this merge to the user and "
+                    "re-run with --yes only after they said yes.",
+                    file=sys.stderr,
+                )
+            return 2
+        decision, p = review.review_merge(p, opts, lambda t: merger.preview(repo, p.source, t))
+        if decision != review.APPROVED:
+            print("Cancelled - nothing was merged.")
+            return 3
+
+    result = merger.merge(p, opts.strategy, opts.message, opts.delete_branch, opts.push)
+    if args.json:
+        print(json.dumps(merger.result_dict(result), indent=2))
+    else:
+        print(merger.format_result(result))
+    return 0 if result.ok else 1
 
 
 def cmd_install_hooks(args: argparse.Namespace) -> int:
@@ -176,7 +227,8 @@ def cmd_uninstall_hooks(args: argparse.Namespace) -> int:
 
 
 def cmd_install_skill(args: argparse.Namespace) -> int:
-    print(f"skill installed: {skill.install(args.target)}")
+    for dest in skill.install(args.target):
+        print(f"skill installed: {dest}")
     return 0
 
 
@@ -232,6 +284,7 @@ def build_parser() -> argparse.ArgumentParser:
     g = p.add_mutually_exclusive_group(required=True)
     g.add_argument("--staged", action="store_true", help="check the index (pre-commit)")
     g.add_argument("--worktree", action="store_true", help="check every uncommitted change incl. untracked")
+    g.add_argument("--tracked", action="store_true", help="audit every file already committed (finds past mistakes)")
     g.add_argument("--unpushed", action="store_true", help="check commits not on any remote")
     g.add_argument("--range", nargs="+", metavar="REV", help="check commits selected by git log revs")
     g.add_argument("--pre-push", nargs="*", metavar="ARG", help="read pre-push refs from stdin")
@@ -245,8 +298,33 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("plan", help="path to the plan JSON file")
     p.add_argument("--dry-run", action="store_true", help="only show every commit, its files and exclusions")
     p.add_argument("--yes", "-y", action="store_true", help="the user already approved this exact plan; do not ask")
+    p.add_argument("--no-hide", action="store_true",
+                   help="do not add untracked local-only files to .git/info/exclude (they are still not committed)")
     p.add_argument("--json", action="store_true")
     p.set_defaults(func=cmd_commit)
+
+    def add_merge_args(p: argparse.ArgumentParser) -> None:
+        p.add_argument("--source", help="branch to merge (default: the current branch)")
+        p.add_argument("--into", help="target branch (default: origin's default branch, else main/master)")
+        p.add_argument("--strategy", choices=list(merger.STRATEGIES), default="merge",
+                       help="merge = merge commit (default), squash = one commit, ff = fast-forward only")
+        p.add_argument("--fetch", action="store_true", help="git fetch origin first")
+        p.add_argument("--json", action="store_true")
+
+    p = sub.add_parser("merge-plan", help="preview merging the current branch into main (changes nothing)")
+    add_repo_args(p)
+    add_merge_args(p)
+    p.add_argument("--all", action="store_true", help="include repos with nothing to merge")
+    p.set_defaults(func=cmd_merge_plan)
+
+    p = sub.add_parser("merge", help="show the merge in full, ask yes/no/other, then merge locally")
+    p.add_argument("-C", dest="repo", default=".", help="repo path (default: current folder)")
+    add_merge_args(p)
+    p.add_argument("--message", "-m", help="merge/squash commit message (\\n for new lines)")
+    p.add_argument("--delete-branch", action="store_true", help="delete the merged branch afterwards")
+    p.add_argument("--push", action="store_true", help="push the target branch to origin afterwards")
+    p.add_argument("--yes", "-y", action="store_true", help="the user already approved this exact merge; do not ask")
+    p.set_defaults(func=cmd_merge)
 
     p = sub.add_parser("install-hooks", help="install pre-commit and pre-push guard hooks")
     add_repo_args(p)
@@ -257,8 +335,8 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_args(p)
     p.set_defaults(func=cmd_uninstall_hooks)
 
-    p = sub.add_parser("install-skill", help="(re)install the /smart-commit Cursor skill")
-    p.add_argument("--target", help=f"skill folder (default: {skill.default_target()})")
+    p = sub.add_parser("install-skill", help="(re)install the /smart-commit and /smart-merge Cursor skills")
+    p.add_argument("--target", help=f"skills folder (default: {skill.default_root()})")
     p.set_defaults(func=cmd_install_skill)
     return ap
 

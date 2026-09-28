@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Callable
 
-from . import committer
+from . import committer, merger
 from .committer import PlannedCommit, RepoResult
 from .gitops import git
 from .status import FileChange, file_changes
@@ -64,23 +64,47 @@ def render(plan: Plan, results: list[RepoResult]) -> str:
         for pc in commits:
             number += 1
             title, _, body = pc.message.partition("\n")
-            kept = [f for f in pc.files if f in changes and f not in res.excluded]
-            files_total += len(kept)
-            skip_note = "" if kept else "   -> will be SKIPPED, no files left to commit"
-            lines.append(f"  [{number}] {title}{skip_note}")
+            subject = pc.message.splitlines()[0]
+            flag = res.flagged.get(subject)
+            flag_skip = bool(flag) and not pc.server_reason
+            kept = [f for f in pc.files if f in changes and f not in res.excluded and f not in res.local_only]
+            if not flag_skip:
+                files_total += len(kept)
+            if flag_skip:
+                note = f"   -> will be SKIPPED: flagged LOCAL-ONLY ({flag}) and the plan gives no server_reason"
+            elif flag:
+                note = f"   !! flagged LOCAL-ONLY ({flag})"
+            elif not kept:
+                note = "   -> will be SKIPPED, no files left to commit"
+            else:
+                note = ""
+            lines.append(f"  [{number}] {title}{note}")
             lines.extend(f"       | {b}" for b in body.strip("\n").splitlines())
             for i, f in enumerate(pc.files, 1):
-                if f in res.excluded:
+                if f in res.local_only:
+                    info = f"EXCLUDED as local-only: {res.local_only[f]}"
+                elif f in res.excluded:
                     info = f"EXCLUDED by guard: {res.excluded[f]}"
                 elif f in changes:
                     info = _describe(changes[f])
+                    if f in res.local_allowed:
+                        info += f"; local-only warning dismissed: {res.local_allowed[f]}"
                 else:
                     info = "no uncommitted changes, ignored"
                 lines.append(f"       {i:>2}. {f}  ({info})")
             if not pc.files:
                 lines.append("       (no files)")
+        if res.local_only:
+            hidden = set(res.hidden)
+            lines.append("  Excluded as local-only (only works on this computer, never committed):")
+            for p, why in sorted(res.local_only.items()):
+                note = "  [will be hidden on this computer: .git/info/exclude]" if p in hidden else ""
+                lines.append(f"       {p}  -- {why}{note}")
+        if res.local_allowed:
+            lines.append("  Local-only warnings dismissed with evidence (these files WILL be committed):")
+            lines.extend(f"       {p}  -- {why}" for p, why in sorted(res.local_allowed.items()))
         if res.warnings:
-            lines.append("  Warnings (these files WILL be committed, please check):")
+            lines.append("  Other warnings (not local-only; these files WILL be committed, please check):")
             lines.extend(f"       {w}" for w in res.warnings)
         if res.left_uncommitted:
             lines.append("  Left uncommitted (not in any commit):")
@@ -220,11 +244,50 @@ def _move_files(plan: Plan, ask: Ask, out: Out) -> None:
     src, dst = plan[ri][1][ci], plan[ri][1][target[1]]
     src.files = [f for f in src.files if f not in moving]
     dst.files.extend(moving)
+    for f in moving:
+        if f in src.allow_local:
+            dst.allow_local[f] = src.allow_local.pop(f)
     out(f"  moved {len(moving)} file(s) to \"{dst.message.splitlines()[0]}\"")
     _drop_if_empty(plan, ri, ci, out)
 
 
-_ACTIONS = {"f": _remove_files, "s": _skip_commits, "m": _edit_message, "v": _move_files}
+def _keep_local(plan: Plan, ask: Ask, out: Out) -> None:
+    picked = _pick_commit(plan, ask, out, "Which commit holds the file?")
+    if not picked:
+        return
+    ri, ci = picked
+    chosen = _pick_files(plan, ri, ci, ask, out, "keep")
+    if not chosen:
+        return
+    try:
+        why = ask("  evidence: which line is it, and why is it detection logic or test data, not a value"
+                  " the app or build uses? (empty = cancel): ").strip()
+    except EOFError:
+        why = ""
+    if not why:
+        out("  nothing changed")
+        return
+    pc = plan[ri][1][ci]
+    for f in chosen:
+        pc.allow_local[f] = why
+    out(f"  {len(chosen)} file(s) kept if their only local-only findings are warnings (a BLOCK is never overridden)")
+
+
+def _server_reason(plan: Plan, ask: Ask, out: Out) -> None:
+    picked = _pick_commit(plan, ask, out, "Which flagged commit?")
+    if not picked:
+        return
+    try:
+        why = ask("  why do its files belong on the server? (empty = cancel): ").strip()
+    except EOFError:
+        why = ""
+    if why:
+        plan[picked[0]][1][picked[1]].server_reason = why
+        out("  reason saved")
+
+
+_ACTIONS = {"f": _remove_files, "s": _skip_commits, "m": _edit_message, "v": _move_files,
+            "l": _keep_local, "r": _server_reason}
 
 
 def _change(plan: Plan, ask: Ask, out: Out) -> None:
@@ -232,11 +295,13 @@ def _change(plan: Plan, ask: Ask, out: Out) -> None:
         "\nWhat do you want to change?\n"
         "  [f] remove file(s) from a commit (they stay uncommitted)\n"
         "  [s] skip whole commit(s)\n"
-        "  [m] change a commit message\n"
+        "  [m] change a commit message (does not clear a local-only flag)\n"
         "  [v] move file(s) to another commit\n"
+        "  [l] keep a file excluded by a local-only WARNING (you must give evidence)\n"
+        "  [r] say why a flagged local-only commit belongs on the server\n"
         "  [b] back"
     )
-    key = _choose(ask, out, "Choice: ", "fsmvb")
+    key = _choose(ask, out, "Choice: ", "fsmvlrb")
     if key in _ACTIONS:
         _ACTIONS[key](plan, ask, out)
 
@@ -255,4 +320,76 @@ def review(plan: Plan, ask: Ask = input, out: Out = print) -> tuple[str, Plan]:
         if key != "o":
             return CANCELLED, plan
         _change(plan, ask, out)
+        out("")
+
+
+def _change_merge(
+    p: merger.MergePreview,
+    opts: merger.MergeOptions,
+    reload: Callable[[str], merger.MergePreview],
+    ask: Ask,
+    out: Out,
+) -> merger.MergePreview:
+    out(
+        "\nWhat do you want to change?\n"
+        "  [s] merge strategy\n"
+        "  [m] merge message\n"
+        f"  [d] delete '{p.source}' after merging (now: {'yes' if opts.delete_branch else 'no'})\n"
+        f"  [p] push '{p.target}' to origin after merging (now: {'yes' if opts.push else 'no'})\n"
+        "  [t] merge into a different branch\n"
+        "  [b] back"
+    )
+    key = _choose(ask, out, "Choice: ", "smdptb")
+    if key == "s":
+        for k, (name, text) in zip("msf", merger.STRATEGIES.items()):
+            out(f"  [{k}] {name}: {text}")
+        pick = _choose(ask, out, "Strategy: ", "msf")
+        if pick:
+            opts.strategy = {"m": "merge", "s": "squash", "f": "ff"}[pick]
+            opts.message = None
+    elif key == "m":
+        try:
+            raw = ask("  new message (use \\n for a new line, empty = keep): ").strip()
+        except EOFError:
+            raw = ""
+        if raw:
+            opts.message = raw.replace("\\n", "\n")
+    elif key == "d":
+        opts.delete_branch = not opts.delete_branch
+    elif key == "p":
+        opts.push = not opts.push
+    elif key == "t":
+        try:
+            target = ask(f"  merge into which branch? (now: {p.target}, empty = keep): ").strip()
+        except EOFError:
+            target = ""
+        if target and target != p.target:
+            p = reload(target)
+            opts.message = None
+    return p
+
+
+def review_merge(
+    p: merger.MergePreview,
+    opts: merger.MergeOptions,
+    reload: Callable[[str], merger.MergePreview],
+    ask: Ask = input,
+    out: Out = print,
+) -> tuple[str, merger.MergePreview]:
+    """Loop: show the merge in full -> yes / no / other. `other` changes strategy, message,
+    branch deletion, push or target, and shows it again. `opts` is updated in place."""
+    while True:
+        out(merger.render(p, opts.strategy, opts.message, opts.delete_branch, opts.push))
+        if p.nothing_to_merge:
+            return CANCELLED, p
+        blocked = bool(merger.check(p, opts.strategy))
+        if blocked:
+            key = _choose(ask, out, "\nThis cannot be merged as it is.  [n] no (stop)   [o] other (change something): ", "no")
+        else:
+            key = _choose(ask, out, "\nMerge this?  [y] yes   [n] no   [o] other (change something): ", "yno")
+        if key == "y":
+            return APPROVED, p
+        if key != "o":
+            return CANCELLED, p
+        p = _change_merge(p, opts, reload, ask, out)
         out("")

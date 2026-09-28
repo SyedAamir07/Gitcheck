@@ -91,8 +91,8 @@ def setup(
     for p in config.projects():
         print(f"  {p}{'' if is_repo(p) else '   (missing - remove with: projects remove)'}")
 
-    dest = skill.install(skill_target)
-    print(f"Cursor skill installed: {dest}")
+    for dest in skill.install(skill_target):
+        print(f"Cursor skill installed: {dest}")
 
     targets = [p for p in config.projects() if is_repo(p)]
     if targets:
@@ -110,7 +110,8 @@ def setup(
         "\nDone. How to use it:\n"
         "  1. Restart Cursor (or reload the window) so it picks up the new skill.\n"
         "  2. Open a project in Cursor, finish your work, then type in the chat:  /smart-commit\n"
-        "  3. Check everything any time with:  python gitcheck.py doctor"
+        "  3. To merge your branch into main, type in the chat:  /smart-merge\n"
+        "  4. Check everything any time with:  python gitcheck.py doctor"
     )
     return 0
 
@@ -141,12 +142,13 @@ def doctor(skill_target: str | None = None) -> int:
     has_git = bool(shutil.which("git"))
     line(has_git, f"git: {git('--version').strip() if has_git else 'not found'}", "install git")
 
-    st = skill.state(skill_target)
-    line(
-        st == "ok",
-        f"Cursor skill /{skill.SKILL_NAME}: {st} ({skill_target or skill.default_target()})",
-        "python gitcheck.py install-skill",
-    )
+    for name in skill.SKILL_NAMES:
+        st = skill.state(name, skill_target)
+        line(
+            st == "ok",
+            f"Cursor skill /{name}: {st} ({os.path.join(skill_target or skill.default_root(), name)})",
+            "python gitcheck.py install-skill",
+        )
 
     projects = config.projects()
     print(f"\n  Projects ({config.config_path()}):")
@@ -170,7 +172,7 @@ def uninstall(keep_config: bool, skill_target: str | None = None) -> int:
             print(p)
             for note in hooks.uninstall(p):
                 print(f"  {note}")
-    print(f"skill removed: {skill.uninstall(skill_target)}")
+    print(f"skills removed: {', '.join(skill.uninstall(skill_target)) or 'none'}")
     if not keep_config and os.path.exists(config.config_path()):
         os.remove(config.config_path())
         print(f"config removed: {config.config_path()}")
