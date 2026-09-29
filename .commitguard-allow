@@ -1,0 +1,4 @@
+# The guard's own detection code: its patterns, comments and messages name the addresses it looks for.
+gitcheck/guard.py
+# Tests feed the guard fake local addresses and fake secrets on purpose.
+tests/

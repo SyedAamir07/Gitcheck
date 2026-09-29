@@ -107,5 +107,35 @@ def operation_in_progress(cwd: str | None = None) -> str | None:
     return None
 
 
+_EXCLUDE_HEADER = "# gitcheck: local-only files, hidden on this computer only (delete a line to show it again)"
+
+
+def _exclude_pattern(path: str) -> str:
+    escaped = "".join("\\" + ch if ch in "*?[\\" else ch for ch in path.replace("\\", "/"))
+    return "/" + escaped
+
+
+def hide_locally(repo: str, paths: list[str]) -> list[str]:
+    """Add paths to .git/info/exclude (never committed, only this computer). Returns the new ones."""
+    target = git_path("info/exclude", repo)
+    try:
+        with open(target, encoding="utf-8") as fh:
+            existing = fh.read()
+    except OSError:
+        existing = ""
+    present = {line.strip() for line in existing.splitlines()}
+    added = [p for p in paths if _exclude_pattern(p) not in present]
+    if not added:
+        return []
+    os.makedirs(os.path.dirname(target), exist_ok=True)
+    with open(target, "a", encoding="utf-8", newline="\n") as fh:
+        if existing and not existing.endswith("\n"):
+            fh.write("\n")
+        if _EXCLUDE_HEADER not in present:
+            fh.write(_EXCLUDE_HEADER + "\n")
+        fh.writelines(_exclude_pattern(p) + "\n" for p in added)
+    return added
+
+
 def split_z(out: str) -> list[str]:
     return [p.strip("\n") for p in out.split("\0") if p.strip("\n")]

@@ -6,16 +6,24 @@ Plan file (JSON):
     {
       "path": "D:/Project/backend",
       "commits": [
-        {"message": "feat(docker): add dev image\\n\\nOptional body", "files": ["Dockerfile.dev", "docker-entrypoint.dev.sh"]}
+        {"message": "feat(api): read the API url from config\\n\\nOptional body",
+         "files": ["src/config.ts", "src/detect.ts"],
+         "allow_local": {"src/detect.ts": "line 12 is the check that rejects loopback hosts in user input, not an address the app uses"},
+         "server_reason": "only needed when the message sounds local-only: why these files belong on the server"}
       ]
     }
   ]
 }
 
+Local-only files are never committed: every BLOCK finding, and every local-only WARN finding
+unless `allow_local` gives evidence for that file (detection logic or test data). A commit whose
+message sounds local-only (or that holds files from such a commit, even after rewording) is
+skipped unless it has `server_reason`.
+
 Per repo:
   1. The index is cleared (working tree is never touched) and the original index is saved.
-  2. For each commit: stage its files, run the guard on the index, unstage every blocked
-     file, commit what remains (git hooks still run).
+  2. For each commit: stage its files, run the guard on the index, unstage every blocked or
+     local-only file, commit what remains (git hooks still run).
   3. Guard the new commits again. If anything slipped through, reset --soft to the
      starting HEAD, exclude those files and redo the commits once.
   4. On any failure the repo is restored to its starting HEAD and original index.
@@ -28,8 +36,8 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 
-from . import guard
-from .gitops import GitError, git, head_sha, operation_in_progress
+from . import flags, guard
+from .gitops import GitError, git, head_sha, hide_locally, operation_in_progress
 from .status import porcelain
 
 _ADD_CHUNK = 100
@@ -39,6 +47,8 @@ _ADD_CHUNK = 100
 class PlannedCommit:
     message: str
     files: list[str]
+    allow_local: dict[str, str] = field(default_factory=dict)  # path -> evidence the local warning is not a real value
+    server_reason: str = ""  # why a commit flagged as local-only still belongs on the server
 
 
 @dataclass
@@ -55,8 +65,12 @@ class RepoResult:
     dry_run: bool = False
     commits: list[CommitResult] = field(default_factory=list)
     skipped: list[str] = field(default_factory=list)
-    excluded: dict[str, str] = field(default_factory=dict)
+    excluded: dict[str, str] = field(default_factory=dict)  # blocked for other reasons (secrets, junk, build output)
+    local_only: dict[str, str] = field(default_factory=dict)  # only works on this computer, never committed
+    local_allowed: dict[str, str] = field(default_factory=dict)  # local warning dismissed with evidence from the plan
+    flagged: dict[str, str] = field(default_factory=dict)  # commit subject -> why it looks local-only
     left_uncommitted: list[str] = field(default_factory=list)
+    hidden: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
     error: str | None = None
 
@@ -96,7 +110,11 @@ def load_plan(plan_path: str) -> list[tuple[str, list[PlannedCommit]]]:
             if dup:
                 raise PlanError(f"{path}: file(s) listed in more than one commit: {sorted(dup)}")
             seen.update(files)
-            commits.append(PlannedCommit(msg, files))
+            allow = c.get("allow_local") or {}
+            if not isinstance(allow, dict):
+                raise PlanError(f"{path}: allow_local must be an object of path -> evidence")
+            allow = {_norm(path, p): str(why).strip() for p, why in allow.items() if str(why).strip()}
+            commits.append(PlannedCommit(msg, files, allow, str(c.get("server_reason") or "").strip()))
         out.append((path, commits))
     return out
 
@@ -151,38 +169,91 @@ def _commit(repo: str, message: str) -> str:
     return git("rev-parse", "--short", "HEAD", cwd=repo).strip()
 
 
+def _describe(f: guard.Finding) -> str:
+    return f.reason + (f" (line {f.line}: {f.snippet})" if f.line else "")
+
+
+def _judge(findings: list[guard.Finding], allow: dict[str, str],
+           result: RepoResult | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Files that must not be committed: (blocked for other reasons, local-only). A local-only
+    WARN is let through only when `allow` gives evidence for that file; a BLOCK never is.
+    Records warnings and dismissed local warnings on `result`."""
+    blocked: dict[str, str] = {}
+    local: dict[str, str] = {}
+    for f in sorted(findings, key=lambda f: f.level != guard.BLOCK):
+        if f.local and (f.level == guard.BLOCK or f.path not in allow):
+            local.setdefault(f.path, _describe(f))
+        elif not f.local and f.level == guard.BLOCK:
+            blocked.setdefault(f.path, _describe(f))
+    for p in blocked:
+        local.pop(p, None)
+    if result is None:
+        return blocked, local
+    for f in findings:
+        if f.level != guard.WARN or f.path in blocked or f.path in local:
+            continue
+        if f.local:
+            result.local_allowed.setdefault(f.path, f"{allow[f.path]}  [warning was: {_describe(f)}]")
+        else:
+            loc = f"{f.path}:{f.line}" if f.line else f.path
+            result.warnings.append(f"{loc} -- {f.reason}" + (f" | {f.snippet}" if f.snippet else ""))
+    for p in sorted(set(allow) & set(local)):
+        result.warnings.append(f"{p} -- allow_local ignored: this file has a BLOCK local-only finding"
+                               f" (only {guard.ALLOW_FILE} or '{guard.INLINE_ALLOW}' on the line can let it through)")
+    return blocked, local
+
+
+def _flag_skip(repo: str, pc: PlannedCommit, subject: str, result: RepoResult) -> bool:
+    """True when the commit must be skipped because it looks local-only and has no server_reason."""
+    flag = flags.check(repo, pc.message, pc.files)
+    if not flag:
+        return False
+    if pc.server_reason:
+        result.flagged[subject] = f"{flag}; kept because: {pc.server_reason}"
+        return False
+    result.flagged[subject] = flag
+    result.skipped.append(f"{subject} (flagged local-only: {flag} - re-check its files and leave the local ones"
+                          " out, or give server_reason in the plan)")
+    return True
+
+
 def _attempt(
     repo: str,
     commits: list[PlannedCommit],
     changed: set[str],
     exclude: dict[str, str],
+    local: dict[str, str],
     start: str | None,
     result: RepoResult,
 ) -> None:
     _unstage_all(repo, start)
     result.commits.clear()
     result.skipped.clear()
+    result.local_allowed.clear()
     for pc in commits:
         subject = pc.message.splitlines()[0]
-        files = [f for f in pc.files if f in changed and f not in exclude]
+        files = [f for f in pc.files if f in changed and f not in exclude and f not in local]
         if not files:
-            result.skipped.append(f"{subject} (no files left to commit)")
+            if not _flag_skip(repo, pc, subject, result):
+                result.skipped.append(f"{subject} (no files left to commit)")
             continue
         for i in range(0, len(files), _ADD_CHUNK):
             git("add", "-A", "--", *files[i : i + _ADD_CHUNK], cwd=repo)
 
         findings = guard.run_checks(repo, guard.collect_staged(repo))
-        for path, reason in guard.blocked_paths(findings).items():
+        blocked, local_now = _judge(findings, pc.allow_local, result)
+        for path in set(blocked) | set(local_now):
             _unstage(repo, path, start)
-            exclude[path] = reason
-        for f in findings:
-            if f.level == guard.WARN and f.path not in exclude:
-                loc = f"{f.path}:{f.line}" if f.line else f.path
-                result.warnings.append(f"{loc} -- {f.reason}" + (f" | {f.snippet}" if f.snippet else ""))
+        exclude.update(blocked)
+        local.update(local_now)
 
         staged = _staged_paths(repo)
+        if _flag_skip(repo, pc, subject, result):
+            for path in staged:
+                _unstage(repo, path, start)
+            continue
         if not staged:
-            result.skipped.append(f"{subject} (every file was excluded by the guard)")
+            result.skipped.append(f"{subject} (every file was left out by the guard)")
             continue
         sha = _commit(repo, pc.message)
         result.commits.append(CommitResult(sha, subject, staged))
@@ -194,21 +265,19 @@ def _dry_run(repo: str, commits: list[PlannedCommit], changed: set[str], result:
         subject = pc.message.splitlines()[0]
         files = [f for f in pc.files if f in changed]
         subset = {f: worktree[f] for f in files if f in worktree}
-        findings = guard.run_checks(repo, subset)
-        blocked = guard.blocked_paths(findings)
+        blocked, local = _judge(guard.run_checks(repo, subset), pc.allow_local, result)
         result.excluded.update(blocked)
-        for f in findings:
-            if f.level == guard.WARN and f.path not in blocked:
-                loc = f"{f.path}:{f.line}" if f.line else f.path
-                result.warnings.append(f"{loc} -- {f.reason}" + (f" | {f.snippet}" if f.snippet else ""))
-        kept = [f for f in files if f not in blocked]
+        result.local_only.update(local)
+        kept = [f for f in files if f not in blocked and f not in local]
+        if _flag_skip(repo, pc, subject, result):
+            continue
         if kept:
             result.commits.append(CommitResult("(dry-run)", subject, kept))
         else:
             result.skipped.append(f"{subject} (no files left to commit)")
 
 
-def run_repo(repo: str, commits: list[PlannedCommit], dry_run: bool = False) -> RepoResult:
+def run_repo(repo: str, commits: list[PlannedCommit], dry_run: bool = False, hide_local: bool = True) -> RepoResult:
     result = RepoResult(path=repo, dry_run=dry_run)
     op = operation_in_progress(repo)
     if op:
@@ -226,35 +295,56 @@ def run_repo(repo: str, commits: list[PlannedCommit], dry_run: bool = False) -> 
         start = head_sha(repo)
         orig_tree = git("write-tree", cwd=repo, check=False).strip() or None
         exclude: dict[str, str] = {}
+        local: dict[str, str] = {}
+        allowed = {p: why for pc in commits for p, why in pc.allow_local.items()}
         try:
             for attempt in range(2):
                 result.warnings.clear()
-                _attempt(repo, commits, changed, exclude, start, result)
+                _attempt(repo, commits, changed, exclude, local, start, result)
                 if not result.commits:
                     break
                 revs = [f"{start}..HEAD"] if start else ["HEAD"]
-                leaked = guard.blocked_paths(guard.run_checks(repo, guard.collect_revs(repo, [revs])))
-                if not leaked:
+                blocked, local_now = _judge(guard.run_checks(repo, guard.collect_revs(repo, [revs])), allowed, None)
+                if not blocked and not local_now:
                     break
                 _rollback(repo, start, None)
-                for path, reason in leaked.items():
+                for path, reason in blocked.items():
                     exclude[path] = f"post-commit check: {reason}"
+                for path, reason in local_now.items():
+                    local[path] = f"post-commit check: {reason}"
                 if attempt == 1:
-                    raise GitError(f"blocked files still present after retry: {sorted(leaked)}")
+                    raise GitError(f"blocked files still present after retry: {sorted(set(blocked) | set(local_now))}")
         except Exception as exc:
             _rollback(repo, start, orig_tree)
             result.ok, result.error = False, f"{exc} (repo restored to its starting state)"
             result.commits.clear()
             return result
         result.excluded = exclude
+        result.local_only = local
 
+    if hide_local:
+        _hide_local_only(repo, result)
     committed = {f for c in result.commits for f in c.files}
-    result.left_uncommitted = sorted(changed - committed - set(result.excluded))
+    result.left_uncommitted = sorted(changed - committed - set(result.excluded) - set(result.local_only))
     return result
 
 
-def run_plan(plan_path: str, dry_run: bool = False) -> list[RepoResult]:
-    return [run_repo(repo, commits, dry_run) for repo, commits in load_plan(plan_path)]
+def _hide_local_only(repo: str, result: RepoResult) -> None:
+    """Untracked files that only make sense on this computer are hidden via .git/info/exclude,
+    whether or not they were in the plan, so a later `git add .` cannot pick them up."""
+    findings = guard.run_checks(repo, guard.collect_worktree(repo))
+    untracked = {fc.path for fc in porcelain(repo) if fc.status == "??"}
+    local = sorted(guard.local_only_files(findings) & untracked)
+    if not local:
+        return
+    reasons = guard.local_paths(findings)
+    for p in local:
+        result.local_only.setdefault(p, reasons.get(p, "local-only file"))
+    result.hidden = local if result.dry_run else hide_locally(repo, local)
+
+
+def run_plan(plan_path: str, dry_run: bool = False, hide_local: bool = True) -> list[RepoResult]:
+    return [run_repo(repo, commits, dry_run, hide_local) for repo, commits in load_plan(plan_path)]
 
 
 def to_dict(r: RepoResult) -> dict:
@@ -271,9 +361,21 @@ def format_result(r: RepoResult) -> str:
         lines.extend(f"      {f}" for f in c.files)
     for s in r.skipped:
         lines.append(f"  skipped: {s}")
+    for subject, why in r.flagged.items():
+        lines.append(f"  flagged local-only: {subject}  -- {why}")
+    if r.local_only:
+        lines.append("  Excluded as local-only (never committed):")
+        hidden = set(r.hidden)
+        verb = "will be hidden" if r.dry_run else "hidden"
+        for p, why in sorted(r.local_only.items()):
+            note = f"  [{verb} on this computer: .git/info/exclude]" if p in hidden else ""
+            lines.append(f"      {p}  -- {why}{note}")
     if r.excluded:
         lines.append("  EXCLUDED by guard (not committed):")
         lines.extend(f"      {p}  -- {why}" for p, why in sorted(r.excluded.items()))
+    if r.local_allowed:
+        lines.append("  local-only warning dismissed with evidence from the plan (committed):")
+        lines.extend(f"      {p}  -- {why}" for p, why in sorted(r.local_allowed.items()))
     if r.warnings:
         lines.append("  warnings (committed, please review):" if not r.dry_run else "  warnings:")
         lines.extend(f"      {w}" for w in r.warnings)

@@ -85,6 +85,22 @@ def _upstream(repo: str) -> tuple[str | None, int | None, int | None]:
     return upstream, int(ahead), int(behind)
 
 
+def file_changes(repo: str) -> list[FileChange]:
+    """Uncommitted changes with +/- line counts."""
+    changes = porcelain(repo)
+    stats = _numstat(repo)
+    for fc in changes:
+        if fc.status == "??":
+            fc.added, fc.deleted = _count_lines(os.path.join(repo, fc.path)), 0
+        elif fc.path in stats:
+            fc.added, fc.deleted = stats[fc.path]
+            if fc.added is None:
+                fc.note = "binary"
+        elif "D" not in fc.status:
+            fc.note = "no content diff (line endings or file mode only)"
+    return changes
+
+
 def repo_status(repo: str) -> RepoStatus:
     repo = os.path.abspath(repo)
     try:
@@ -103,17 +119,7 @@ def repo_status(repo: str) -> RepoStatus:
             operation=operation_in_progress(repo),
             hooks_installed=hooks_installed(repo),
         )
-        st.changes = porcelain(repo)
-        stats = _numstat(repo)
-        for fc in st.changes:
-            if fc.status == "??":
-                fc.added, fc.deleted = _count_lines(os.path.join(repo, fc.path)), 0
-            elif fc.path in stats:
-                fc.added, fc.deleted = stats[fc.path]
-                if fc.added is None:
-                    fc.note = "binary"
-            elif "D" not in fc.status:
-                fc.note = "no content diff (line endings or file mode only)"
+        st.changes = file_changes(repo)
         st.findings = guard.run_checks(repo, guard.collect_worktree(repo))
         return st
     except Exception as exc:  # one broken repo must not hide the others
