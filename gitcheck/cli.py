@@ -116,7 +116,7 @@ def cmd_guard(args: argparse.Namespace) -> int:
 
 def _interactive() -> bool:
     # Agent shells can report a TTY on stdin; a prompt there would hang, so they must use --yes.
-    if os.environ.get("CURSOR_AGENT"):
+    if os.environ.get("CURSOR_AGENT") or os.environ.get("CLAUDECODE"):
         return False
     return sys.stdin.isatty() and sys.stdout.isatty()
 
@@ -227,8 +227,8 @@ def cmd_uninstall_hooks(args: argparse.Namespace) -> int:
 
 
 def cmd_install_skill(args: argparse.Namespace) -> int:
-    for dest in skill.install(args.target):
-        print(f"skill installed: {dest}")
+    for client, dest in skill.install(args.target):
+        print(f"{client} skill installed: {dest}")
     return 0
 
 
@@ -335,8 +335,10 @@ def build_parser() -> argparse.ArgumentParser:
     add_repo_args(p)
     p.set_defaults(func=cmd_uninstall_hooks)
 
-    p = sub.add_parser("install-skill", help="(re)install the /smart-commit and /smart-merge Cursor skills")
-    p.add_argument("--target", help=f"skills folder (default: {skill.default_root()})")
+    p = sub.add_parser("install-skill",
+                       help="(re)install the /smart-commit and /smart-merge skills for Cursor and Claude Code")
+    p.add_argument("--target", help="skills folder (default: "
+                   + ", ".join(r for _, r in skill.default_roots()) + " - those whose app is installed)")
     p.set_defaults(func=cmd_install_skill)
     return ap
 
