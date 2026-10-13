@@ -15,7 +15,12 @@ Run the CLI from the workspace root:
 "{{PYTHON}}" "{{GITCHECK}}" <command>
 ```
 
-In PowerShell prefix it with `&`: `& "{{PYTHON}}" "{{GITCHECK}}" <command>`. Below, `gitcheck <command>` means this full invocation.
+In PowerShell prefix it with `&`: `& "{{PYTHON}}" "{{GITCHECK}}" <command>`. In bash (Claude Code uses Git Bash on Windows) run it as shown. Below, `gitcheck <command>` means this full invocation.
+
+**Asking the user:** "AskQuestion" below means your client's multiple-choice question tool
+(`AskQuestion` in Cursor, `AskUserQuestion` in Claude Code; `allow_multiple` is `multiSelect` there).
+If a question needs more options than the tool allows (Claude Code allows 4), ask it as a numbered
+list in plain text instead and let the user answer with numbers or in their own words.
 
 Never force-push. Never use `--no-verify`. Never `reset --hard`, rebase, or rewrite commits that are
 already on the target or on a remote. Never delete a branch unless the user chose that option.

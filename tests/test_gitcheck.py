@@ -848,6 +848,55 @@ class SetupAndConfig(unittest.TestCase):
         self.assertFalse(hooks.hooks_installed(self.a))
         self.assertEqual(config.projects(), [])
 
+    def test_skills_go_to_every_installed_client(self):
+        from gitcheck import installer, skill
+
+        home = os.path.join(self.tmp, "home")
+        cursor_root = os.path.join(home, ".cursor", "skills")
+        claude_root = os.path.join(home, ".claude", "skills")
+        saved = {k: os.environ.get(k) for k in ("HOME", "USERPROFILE")}
+        os.environ["HOME"] = os.environ["USERPROFILE"] = home
+        try:
+            self.assertEqual(skill.roots(), [("Cursor", cursor_root), ("Claude Code", claude_root)])
+
+            os.makedirs(os.path.join(home, ".claude"))
+            self.assertEqual(skill.roots(), [("Claude Code", claude_root)])
+            installed = skill.install()
+            self.assertEqual({c for c, _ in installed}, {"Claude Code"})
+            self.assertFalse(os.path.exists(cursor_root))
+            self.assertEqual(installer.doctor(), 0)
+
+            os.makedirs(os.path.join(home, ".cursor"))
+            self.assertEqual(installer.doctor(), 1)
+            skill.install()
+            for root in (cursor_root, claude_root):
+                self.assertEqual([skill.state(n, root) for n in skill.SKILL_NAMES], ["ok", "ok"])
+            self.assertEqual(installer.doctor(), 0)
+
+            self.assertEqual(len(skill.uninstall()), 4)
+            for root in (cursor_root, claude_root):
+                self.assertEqual([skill.state(n, root) for n in skill.SKILL_NAMES], ["missing", "missing"])
+        finally:
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+    def test_agent_shells_are_never_interactive(self):
+        from gitcheck import cli
+
+        saved = {k: os.environ.pop(k, None) for k in ("CURSOR_AGENT", "CLAUDECODE")}
+        try:
+            for var in saved:
+                os.environ[var] = "1"
+                self.assertFalse(cli._interactive())
+                del os.environ[var]
+        finally:
+            for k, v in saved.items():
+                if v is not None:
+                    os.environ[k] = v
+
     def test_hooks_path_repo_is_skipped(self):
         git("config", "core.hooksPath", ".husky", cwd=self.a)
         notes = hooks.install(self.a)
