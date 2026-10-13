@@ -4,7 +4,7 @@ Plan file (JSON):
 {
   "repos": [
     {
-      "path": "/path/to/repo",
+      "path": "D:/Project/backend",
       "commits": [
         {"message": "feat(api): read the API url from config\\n\\nOptional body",
          "files": ["src/config.ts", "src/detect.ts"],
