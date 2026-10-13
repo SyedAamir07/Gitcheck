@@ -14,7 +14,12 @@ Run the CLI from the workspace root:
 "{{PYTHON}}" "{{GITCHECK}}" <command>
 ```
 
-In PowerShell prefix it with `&`: `& "{{PYTHON}}" "{{GITCHECK}}" <command>`. Below, `gitcheck <command>` means this full invocation.
+In PowerShell prefix it with `&`: `& "{{PYTHON}}" "{{GITCHECK}}" <command>`. In bash (Claude Code uses Git Bash on Windows) run it as shown. Below, `gitcheck <command>` means this full invocation.
+
+**Asking the user:** "AskQuestion" below means your client's multiple-choice question tool
+(`AskQuestion` in Cursor, `AskUserQuestion` in Claude Code; `allow_multiple` is `multiSelect` there).
+If a question needs more options than the tool allows (Claude Code allows 4), ask it as a numbered
+list in plain text instead and let the user answer with numbers or in their own words.
 
 Never push. Never use `--no-verify`. Never edit, delete or `git checkout` the user's files.
 
@@ -149,7 +154,7 @@ Nothing is committed before the user has seen every commit and said Yes. This ap
 run, including "just commit everything" requests. The only exception is when the user explicitly
 said in this request not to ask (for example "bina puchay commit kar do").
 
-**a. Write the plan** to a JSON file in the OS temp folder (`$env:TEMP` on Windows, `/tmp` on macOS/Linux), never inside a repo:
+**a. Write the plan** to a JSON file in the OS temp folder (Windows: `$env:TEMP` in PowerShell, `$TEMP` in bash; macOS/Linux: `/tmp`), never inside a repo:
 
 ```json
 {
