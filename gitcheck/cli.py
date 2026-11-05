@@ -105,7 +105,14 @@ def cmd_guard(args: argparse.Namespace) -> int:
     elif args.range:
         mode, changes = "range", guard.collect_revs(repo, [args.range])
     else:
-        mode, changes = "pre-push", guard.collect_revs(repo, guard.pre_push_rev_sets(repo, sys.stdin.read()))
+        stdin_text = sys.stdin.read()
+        ranges = guard.pre_push_ranges(stdin_text)
+        # Judge the tree that lands, not every historical added line.
+        changes = {}
+        for old_sha, new_sha in ranges:
+            for path, change in guard.collect_tip_delta(repo, old_sha, new_sha).items():
+                changes.setdefault(path, guard.Change()).added.extend(change.added)
+        mode = "pre-push"
     findings = guard.run_checks(repo, changes)
     if args.json:
         print(json.dumps([asdict(f) for f in findings], indent=2))

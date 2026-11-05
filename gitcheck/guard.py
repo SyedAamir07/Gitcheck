@@ -314,6 +314,55 @@ def pre_push_rev_sets(repo: str, stdin_text: str) -> list[list[str]]:
     return rev_sets
 
 
+def collect_tip_delta(repo: str, old_sha: str, new_sha: str) -> dict[str, Change]:
+    """Lines present in [new_sha] for files that differ from [old_sha].
+
+    Pre-push uses this so a localhost default that a later commit already removed
+    does not block the push. Only the tree that lands on the remote is judged.
+    """
+    if old_sha == ZERO_SHA or not has_commit(old_sha, repo):
+        names = split_z(git("diff-tree", "-r", "-z", "--no-commit-id", "--name-only",
+                            "--diff-filter=ACMR", EMPTY_TREE, new_sha, cwd=repo))
+    else:
+        names = split_z(git("diff", "--name-only", "-z", "--diff-filter=ACMR",
+                            old_sha, new_sha, cwd=repo))
+    changes: dict[str, Change] = {}
+    for path in names:
+        blob = git("show", f"{new_sha}:{path}", cwd=repo, check=False)
+        if blob is None or "\0" in blob[:8192]:
+            continue
+        if len(blob) > MAX_UNTRACKED_BYTES:
+            continue
+        changes[path] = Change(added=[(i, text, "") for i, text in enumerate(blob.splitlines(), 1)])
+    return changes
+
+
+def pre_push_ranges(stdin_text: str) -> list[tuple[str, str]]:
+    """(remote_sha, local_sha) for each ref being updated. Delete pushes are skipped."""
+    out = []
+    for line in stdin_text.splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        _local_ref, local_sha, _remote_ref, remote_sha = parts
+        if local_sha == ZERO_SHA:
+            continue
+        out.append((remote_sha, local_sha))
+    return out
+
+
+def pre_push_local_shas(stdin_text: str) -> list[str]:
+    shas = []
+    for line in stdin_text.splitlines():
+        parts = line.split()
+        if len(parts) != 4:
+            continue
+        local_sha = parts[1]
+        if local_sha != ZERO_SHA:
+            shas.append(local_sha)
+    return shas
+
+
 def load_allowlist(repo: str) -> list[str]:
     try:
         with open(os.path.join(repo, ALLOW_FILE), encoding="utf-8") as fh:
