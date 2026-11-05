@@ -84,28 +84,34 @@ Everything committed here ends up on the server and on every teammate's machine.
 strict on purpose. They apply to every project and every kind of file, and none of them depends on
 a specific file name, project or tool.
 
-**Rule 1: what counts as local-only.** A file is local-only if it points at this machine
-*anywhere*: `localhost`, `127.0.0.1`, `0.0.0.0`, `10.0.2.2` and other emulator addresses, LAN or
-private-network IPs (`192.168.x.x`, `10.x.x.x`, `172.16-31.x.x`), `*.local` hostnames,
-`host.docker.internal`, this computer's name, home or user folder paths (`C:\Users\<name>\...`,
-`/Users/<name>/...`, drive paths), a specific phone or emulator ID, or ports that only a local dev
-setup uses. It counts wherever it appears: code, config, **default or fallback values**,
-**comments**, **examples**, **build or run instructions**, and scripts. A fallback to localhost
-counts (`${API_URL:-http://localhost:3000}`, `?? 'http://localhost:3000'`, `default: ...`).
-"An env var can override it" does not make it safe: the default still ships.
-The only exceptions are tests, and docs that explicitly explain local setup.
+**Rule 1: what counts as local-only.** A file is local-only if it *ships a connection target* for
+this machine: full URLs (`http://localhost:3000`, `http://192.168.x.x:…`), defaults/fallbacks
+(`${API_URL:-http://localhost:3000}`, `?? 'http://localhost:3000'`, `defaultValue: 'http://…'`),
+compose/CI/Dockerfile env, dart-defines, comments or scripts that tell people to use those URLs,
+bare settings (`API_HOST=localhost`, `host: 'localhost'`), this computer's name, home/user folder
+paths, a specific phone ID, or machine-setup scripts. "An env var can override it" does not make a
+localhost **default** safe: the default still ships.
+
+**Not local-only (safe to commit):** host **detection / rewrite** that compares or classifies
+hostnames so production can reject or remap bad URLs — e.g. `host === 'localhost'`,
+`startsWith('192.168.')`, `apiBaseLooksPrivate`, RFC1918 comments, media-URL fallback helpers.
+Production apps need this when the API still returns stored LAN absolute media URLs. That is
+different from making localhost the production API base. Prefer writing clear compares/helpers so
+the guard recognizes them; do not put `commitguard: allow` on a real `http://localhost` default.
+
+Exceptions that skip the guard: tests, and docs that explicitly explain local setup.
 
 Files that set up this computer or a device (firewall or port rules, port forwarding, tunnels,
 hosts-file edits, admin-only setup), personal material (notes, run-command cheat sheets, scratch
-files, debug dumps, local DB dumps, IDE settings) and changes that only switch the app to local
+files, device dumps, local DB dumps, IDE settings) and changes that only switch the app to local
 values are local-only too.
 
-**Rule 2: warnings are real until proven otherwise.** Treat every guard warning about a local
-signal (shown as `LOCAL` in `gitcheck guard`, "EXCLUDED as local-only" in the preview) as correct.
-You may dismiss one only when you open the line and can show it is **detection logic** (code that
-checks for or rejects localhost, such as validation) or **test data**, not a value the app or the
-build uses. Then put that evidence in the plan under `allow_local` for that file (step 5), quoting
-the line. "It is only a default", "it is only a comment" and "an env var overrides it" are *not*
+**Rule 2: warnings are real until proven otherwise.** Treat every remaining guard warning about a
+local signal (shown as `LOCAL` in `gitcheck guard`, "EXCLUDED as local-only" in the preview) as
+correct. Clear host-detection compares are auto-allowed by the guard now. For ambiguous bare
+`localhost` mentions that are not compares/helpers, dismiss only when you can show **test data**
+or true detection the guard missed — then put evidence in `allow_local` (step 5), quoting the
+line. "It is only a default", "it is only a comment" and "an env var overrides it" are *not*
 evidence. If you cannot show it, the file stays excluded. `BLOCK` findings can never be dismissed
 this way.
 
@@ -291,16 +297,17 @@ Delete the temp plan file. Do not push; if the user asks to push, the pre-push h
 - `gitcheck guard -C <repo> --worktree | --staged | --unpushed | --range <revs>` checks changed paths and added lines; `--tracked` audits every file already committed.
 - BLOCK: `.env*` (except `*.example`/`*.sample`/`*.template`), `*.log`, keys/keystores (`*.pem`, `*.key`, `*.jks`, `key.properties`, service-account JSON), private keys/tokens in content, `node_modules/`, `.dart_tool/`, `__pycache__/`, root `build/` / `dist/`.
 - BLOCK, local-only (only tests are skipped; docs only warn):
-  - any local or private-network URL (`localhost`, `127.x`, `0.0.0.0`, `[::1]`, `10.x`, `172.16-31.x`, `192.168.x`, `*.local`, `host.docker.internal`) in code, config, compose files, Dockerfiles, proxy configs, CI files, scripts, `*.example` templates and no-extension files, **including default / fallback values and comments / build instructions**;
+  - any local or private-network **URL target** (`http://localhost:3000`, `http://192.168…`) in code, config, compose, Dockerfiles, proxy, CI, scripts, `*.example` templates — including **defaults / fallbacks** and comments / build instructions that tell people to use them;
   - a connection setting assigned a bare localhost (`API_HOST=localhost:3000`, `host: 'localhost'`, `proxy: 127.0.0.1`);
-  - LAN / emulator addresses (`192.168.x.x`, `172.16-31.x.x`, `10.0.2.2`, `10.0.3.2`) anywhere except docs;
+  - LAN / emulator addresses used as targets (`192.168.x.x`, `172.16-31.x.x`, `10.0.2.2`) anywhere except docs and host-detection logic;
   - this computer's identity: `C:\Users\<name>\...` / `/Users/<name>/` paths, its computer name, its LAN IPs (worked out at runtime); drive paths like `D:\Project\...` outside code;
   - in scripts, `.txt` notes and extension-less files: firewall / port rules, hosts-file edits, run-as-administrator setup, phone / emulator port forwarding, tunnels, runs on one specific device;
   - scripts named for machine setup (`*firewall*`, `allow-port*`, `open-port*`, `port-forward*`, `portproxy*`);
   - local-named files: `*.local`, `*.local.*`, compose override files, non-code files named like `run_local.ps1`, `local.properties`;
   - container builds (any Dockerfile / Containerfile) that `COPY`/`ADD` env files, local build output (`build/`, `dist/`, `out/`, ...), local settings, or the whole folder without a `.dockerignore` that keeps `.env*` out;
   - the user's own rules: `~/.gitcheck/local-only` (every repo) and `<repo>/.commitguard-local` (one repo), one path glob per line or `content: <regex>`.
-- WARN, local-only (excluded unless `allow_local` evidence): a bare `localhost` mention that is not a setting (often detection logic), drive paths in code, local addresses / machine setup in docs, `tmp/`, `scratch/`, `uploads/`, `.idea/`, debug `.txt` output, `*.bak` / `*.tmp` / `*.orig`; **new** run / deploy setup that nothing in the project references, or that duplicates an existing deploy path.
+- Allowed automatically: host **detection / rewrite** (`host === 'localhost'`, `startsWith('192.168.')`, `apiBaseLooksPrivate`, RFC1918 comments). Production media fallback needs this; it is not a localhost API default.
+- WARN, local-only (excluded unless `allow_local` evidence): ambiguous bare `localhost` mentions that are not compares/helpers, drive paths in code, local addresses / machine setup in docs, `tmp/`, `scratch/`, `uploads/`, `.idea/`, debug `.txt` output, `*.bak` / `*.tmp` / `*.orig`; **new** run / deploy setup that nothing in the project references, or that duplicates an existing deploy path.
 - WARN, judge it: `ufw` / `iptables` / `firewall-cmd` (fine in server provisioning), `Set-ExecutionPolicy`, dev run commands in scripts, `google-services.json`, hardcoded credentials.
-- A real false positive: add the path to `.commitguard-allow` in the repo root, or put `commitguard: allow` on the line. Only use this for the guard's own detection code, tests, or a case the user confirmed; never to get a local value through.
+- A real false positive: add the path to `.commitguard-allow` in the repo root, or put `commitguard: allow` on the line. Never use this to ship a localhost **default** / production API target.
 - Other commands: `gitcheck projects list|add|remove`, `gitcheck doctor`.
