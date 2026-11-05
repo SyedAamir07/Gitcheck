@@ -1,12 +1,16 @@
 """Detect files and content that must never reach the remote: env files, secrets, logs,
 build output, and anything that only works on this computer: localhost / LAN / emulator
-addresses anywhere (code, config, compose, Dockerfiles, scripts, CI, defaults, fallbacks,
-comments, examples), this computer's paths / name / IPs, machine and device setup, local-named
-files, new run/deploy setup that nothing uses, and container builds that copy local material.
+*targets* (defaults, fallbacks, compose/CI env, dart-defines, build comments), this
+computer's paths / name / IPs, machine and device setup, local-named files, unused
+run/deploy setup, and container builds that copy local material.
 
-Every such finding has `local=True`. BLOCK findings are never committed; local WARN findings
-are excluded by the commit step unless the plan gives evidence that the line is detection
-logic or test data. Only tests are skipped; docs only warn (allowed when they explain local setup).
+Host *detection* (compare / startsWith / RFC1918 rewrite helpers) is allowed — production
+apps need it to remap stored LAN media URLs. That is not the same as shipping
+`http://localhost` as the API base.
+
+Every local-target finding has `local=True`. BLOCK findings are never committed; remaining
+local WARN findings are excluded unless the plan gives evidence (ambiguous bare localhost
+or test data). Tests are skipped; docs only warn.
 
 Escape hatches per repo:
   .commitguard-allow    one glob per line at the repo root; matching paths are skipped
@@ -497,6 +501,27 @@ _LOCAL_URL_MSG = "points at this computer / private network - breaks on the serv
 _COMMENT_RE = re.compile(r"^\s*(?:#|//|/\*|\*|<!--|::|rem\b|--|;)", re.I)
 _DEFAULT_RE = re.compile(r"\$\{[^}]*:?-|\?\?|\|\||\bor\b|\bdefault", re.I)
 
+# Host / LAN mentions that check or rewrite bad URLs — not a value the app connects to.
+# Production code may need these so phones never follow stored `http://192.168…` links.
+_DETECTION_LOGIC_RE = re.compile(
+    r"(?:"
+    r"\b(?:is(?:Private|Loopback|Local(?:Host|host)?|Lan)|looksPrivate|apiBaseLooksPrivate|"
+    r"privateOrLoopback|isDevHost|rewriteUpload|resolveStaticUpload|mediaFallback)\b"
+    r"|\bRFC\s*1918\b"
+    r"|172\.16\.0\.0/12|10\.0\.0\.0/8|192\.168\.0\.0/16"
+    r"|\.(?:startsWith|includes|contains|indexOf|endsWith)\(\s*['\"](?:192\.168\.|10\.|172\.|localhost|127\.)"
+    r"|/(?:\^)?(?:192\\\.168|10\\\.|172\\\.\(|localhost|127\\\.)"
+    r"|r['\"].*(?:192\\\.168|172\\\.\(|10\\\.|localhost)"
+    r"|RegExp\(\s*['\"].*(?:192\\\.168|172\\\.|localhost)"
+    r"|(?:host(?:name)?|\bh\b)\s*(?:===?|!==?|==|!=)\s*['\"](?:localhost|127\.0\.0\.1|::1)"
+    r"|['\"](?:localhost|127\.0\.0\.1|::1)['\"]\s*(?:===?|!==?|==|!=)"
+    r"|\.equals\(\s*['\"](?:localhost|127\.0\.0\.1)['\"]"
+    r")",
+    re.I,
+)
+# Nest / YAML style `host: 'localhost'` is a connection target, not a comparison.
+_HOST_ASSIGN_RE = re.compile(r"\bhost\s*:\s*['\"](?:localhost|127\.0\.0\.1)['\"]", re.I)
+
 
 def _url_reason(text: str) -> str:
     if _COMMENT_RE.search(text):
@@ -506,13 +531,42 @@ def _url_reason(text: str) -> str:
     return _LOCAL_URL_MSG
 
 
+def _ships_local_url_target(text: str) -> bool:
+    """True when the line embeds a local URL the app, config, or build would actually use."""
+    # Any scheme://localhost|LAN URL is treated as a shipped target (default, assignment,
+    # comment instruction, or example). Detection helpers should compare hostnames / prefixes,
+    # not embed http://192.168… as a runtime value.
+    return bool(LOCAL_URL_RE.search(text))
+
+
+def is_host_detection_logic(text: str) -> bool:
+    """Hostname / LAN checks used to reject or rewrite bad URLs — safe to ship.
+
+    Not the same as hardcoding `http://localhost` as the production API target.
+    """
+    if _HOST_ASSIGN_RE.search(text):
+        return False
+    if _DETECTION_LOGIC_RE.search(text):
+        return True
+    # Bare compare without a helper name: `return h === 'localhost'`
+    if re.search(
+        r"(?:===?|!==?|==|!=)\s*['\"](?:localhost|127\.0\.0\.1|::1)['\"]"
+        r"|['\"](?:localhost|127\.0\.0\.1|::1)['\"]\s*(?:===?|!==?|==|!=)",
+        text,
+        re.I,
+    ):
+        return not _ships_local_url_target(text)
+    return False
+
+
 def local_finding(path: str, text: str) -> tuple[str, str, str] | None:
     """(level, reason, snippet) when an added line points at this computer or its network.
 
-    Anything local is BLOCK, including defaults, fallbacks, comments, examples and build or run
-    instructions. What stays WARN still counts as local-only (Finding.local) and is excluded by
-    the commit step unless the plan shows it is detection logic or test data. Docs are WARN: they
-    are allowed only when they explain local setup."""
+    Shipped localhost / LAN *targets* (defaults, assignments, build instructions) are BLOCK.
+    Host *detection* (compare / startsWith / RFC1918 rewrite helpers) is allowed and returns None
+    so production media/URL guards can commit without `commitguard: allow`.
+    Docs stay WARN. Other local WARNs are still excluded by the commit step unless the plan
+    gives evidence."""
     ext = os.path.splitext(path)[1].lower()
     in_code = ext in CODE_EXTS
 
@@ -523,6 +577,10 @@ def local_finding(path: str, text: str) -> tuple[str, str, str] | None:
             hit = next((rx.search(text) for _, rx, _ in MACHINE_SETUP_RULES if rx.search(text)), None)
         if hit:
             return WARN, "local address / setup in docs - allowed only if the doc explains local setup", hit.group(0)[:100]
+        return None
+
+    # Detection / rewrite logic first — but never when the same line ships a local URL target.
+    if is_host_detection_logic(text) and not _ships_local_url_target(text):
         return None
 
     dev = DEV_NETWORK_RE.search(text)

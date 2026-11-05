@@ -84,9 +84,14 @@ Add `--help` to any command for its options.
 - **Always blocked**: `.env*` (except `*.example` / `*.sample` / `*.template`), `*.log`, private
   keys and keystores, service-account JSON, private keys or tokens in file content,
   `node_modules/`, `__pycache__/`, root `build/` / `dist/`.
-- **Local-only, kept out of commits**: localhost / LAN / emulator addresses (including defaults
-  and comments), paths to your user folder, your computer's name, firewall / port-forwarding
-  scripts, `*.local` files, and new run or deploy setup that nothing in the project uses.
+- **Local-only, kept out of commits**: localhost / LAN / emulator **targets** (defaults like
+  `?? 'http://localhost:3000'`, compose env, dart-defines, comments that tell people to use
+  them), paths to your user folder, your computer's name, firewall / port-forwarding scripts,
+  `*.local` files, and new run or deploy setup that nothing in the project uses.
+- **Allowed (not local-only)**: host **detection** that compares or rewrites bad URLs — e.g.
+  `host === 'localhost'`, `startsWith('192.168.')`, `apiBaseLooksPrivate`, RFC1918 comments.
+  Production apps need this so stored `http://192.168…` media URLs can fall back to the real
+  API host. That is different from shipping localhost as the production default.
 - **Warnings**: `google-services.json`, `.idea/`, `*.bak`, `*.tmp` and similar.
 
 ### Your own rules
@@ -95,7 +100,8 @@ Add `--help` to any command for its options.
   per line, or `content: <regex>`, for files or lines that are local-only for you.
 - `<repo>/.commitguard-allow`: one path glob per line that the guard should skip (real false
   positives only).
-- `commitguard: allow` on a line skips content checks for that line.
+- `commitguard: allow` on a line skips content checks for that line (rarely needed for host
+  detection now — prefer writing a clear compare / helper so the guard recognizes it).
 
 ## Update
 

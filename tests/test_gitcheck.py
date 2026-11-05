@@ -155,17 +155,39 @@ class LocalOnly(unittest.TestCase):
 
         self.assertEqual(self.levels("test/api_test.dart", "final u = 'http://localhost:3000';"), [])
 
-    def test_docs_and_detection_logic_warn_as_local_only(self):
+    def test_docs_warn_as_local_only(self):
         for path, line in [
             ("docs/setup.md", "REDIS_URL=redis://localhost:6379"),
             ("docs/setup.md", "netsh advfirewall firewall add rule"),
-            ("src/url.ts", "  return host !== 'localhost' && !isIp(host);"),
             ("src/paths.ts", "const p = 'D:\\\\data';"),
         ]:
             found = self.findings(path, line)
             self.assertEqual([f.level for f in found], [guard.WARN], f"{path}: {line}")
             self.assertTrue(found[0].local, path)
         self.assertEqual(self.levels("scripts/provision.sh", "ufw allow 443"), [guard.WARN])
+
+    def test_host_detection_logic_is_allowed(self):
+        """Compare / rewrite helpers may mention localhost or LAN — they are not API targets."""
+        for path, line in [
+            ("src/url.ts", "  return host !== 'localhost' && !isIp(host);"),
+            ("src/detect.ts", "export const isLocal = (h: string) => h === 'localhost';"),
+            ("lib/media.ts", "  if (host.startsWith('192.168.') || host.startsWith('10.')) return true;"),
+            ("lib/media.ts", "  // commitguard: allow — detect RFC1918 172.16.0.0/12 for media rewrite"),
+            ("lib/media.ts", "  // RFC1918 172.16.0.0/12"),
+            ("lib/media_utils.dart", "  static bool get apiBaseLooksPrivate {"),
+            ("lib/media_utils.dart", "    if (host == 'localhost' || host == '127.0.0.1' || host == '::1') {"),
+            ("lib/media_utils.dart", r"    final m = RegExp(r'^172\.(1[6-9]|2\d|3[0-1])\.').firstMatch(host);"),
+        ]:
+            self.assertEqual(self.levels(path, line), [], f"{path}: {line}")
+        # Still block a real shipped LAN / localhost URL in the same kinds of files.
+        self.assertEqual(
+            self.levels("lib/media.ts", "const api = 'http://192.168.1.123:3000/uploads/x.jpg';"),
+            [guard.BLOCK],
+        )
+        self.assertEqual(
+            self.levels("src/config.ts", "export const api = process.env.API ?? 'http://localhost:3000';"),
+            [guard.BLOCK],
+        )
 
     def test_localhost_as_default_value_in_config_is_blocked(self):
         for path, line in [
@@ -358,20 +380,28 @@ class Committer(RepoTestCase):
         self.assertIn("lib/config.dart", r.local_only)
         self.assertEqual(len(r.skipped), 1)
 
-    def test_local_only_warning_is_excluded_unless_plan_gives_evidence(self):
+    def test_host_detection_commits_without_allow_local(self):
         write(self.repo, "src/detect.ts", "export const isLocal = (h: string) => h === 'localhost';\n")
         write(self.repo, "src/app.ts", "export const app = 1;\n")
         [r] = committer.run_plan(self.plan([{"message": "feat: detect dev host", "files": ["src/detect.ts", "src/app.ts"]}]))
         self.assertTrue(r.ok, r.error)
-        self.assertEqual(self.files_in("HEAD"), ["src/app.ts"])
-        self.assertIn("src/detect.ts", r.local_only)
-        self.assertEqual(r.warnings, [])
+        self.assertEqual(sorted(self.files_in("HEAD")), ["src/app.ts", "src/detect.ts"])
+        self.assertNotIn("src/detect.ts", r.local_only)
 
-        evidence = "line 1 compares the hostname to detect a dev host; no address is used"
-        [r] = committer.run_plan(self.plan([{"message": "feat: detect dev host", "files": ["src/detect.ts"],
-                                             "allow_local": {"src/detect.ts": evidence}}]))
-        self.assertEqual(self.files_in("HEAD"), ["src/detect.ts"])
-        self.assertIn(evidence, r.local_allowed["src/detect.ts"])
+    def test_ambiguous_local_warning_still_needs_allow_local(self):
+        # Bare localhost mention that is not a compare / helper — still local-only WARN.
+        write(self.repo, "src/note.ts", "export const tip = 'use localhost when developing';\n")
+        write(self.repo, "src/app.ts", "export const app = 1;\n")
+        [r] = committer.run_plan(self.plan([{"message": "feat: tip", "files": ["src/note.ts", "src/app.ts"]}]))
+        self.assertTrue(r.ok, r.error)
+        self.assertEqual(self.files_in("HEAD"), ["src/app.ts"])
+        self.assertIn("src/note.ts", r.local_only)
+
+        evidence = "docs tip only; no connection string"
+        [r] = committer.run_plan(self.plan([{"message": "feat: tip", "files": ["src/note.ts"],
+                                             "allow_local": {"src/note.ts": evidence}}]))
+        self.assertEqual(self.files_in("HEAD"), ["src/note.ts"])
+        self.assertIn(evidence, r.local_allowed["src/note.ts"])
 
     def test_evidence_never_overrides_a_local_block(self):
         write(self.repo, "src/config.ts", "export const api = process.env.API ?? 'http://localhost:3000';\n")
@@ -535,11 +565,13 @@ class Review(RepoTestCase):
             {"message": "feat: detect and compose", "files": ["src/detect.ts", "compose.yaml", "src/chart.ts"]},
         ]))
         shown = review.render(plan, review.dry_run(plan))
-        self.assertIn("src/detect.ts  (EXCLUDED as local-only: localhost reference", shown)
+        # Host detection commits; localhost API default in compose stays local-only.
+        self.assertIn("src/detect.ts", shown)
+        self.assertNotIn("src/detect.ts  (EXCLUDED as local-only:", shown)
         self.assertIn("compose.yaml  (EXCLUDED as local-only:", shown)
         self.assertIn("Excluded as local-only (only works on this computer, never committed):", shown)
         self.assertNotIn("WILL be committed", shown)
-        self.assertIn("Total: 1 commit(s), 1 file(s)", shown)
+        self.assertIn("Total: 1 commit(s), 2 file(s)", shown)
 
     def test_yes_and_no(self):
         from gitcheck import review
